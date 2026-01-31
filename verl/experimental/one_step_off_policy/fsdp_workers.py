@@ -167,6 +167,42 @@ class DetachAsyncRolloutWorker(DetachSync):
         ActorRolloutRefWorker.__init__(self, config, role)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        """Override init_model to skip FSDP model loading for rollout-only workers.
+
+        In one_step_off_policy mode, weights are synced via collective broadcast
+        from actor workers, so rollout workers don't need their own FSDP model.
+        This saves ~66GB GPU memory, allowing vLLM to initialize properly.
+        """
+        from verl.utils.import_utils import import_external_libs
+
+        import_external_libs(self.config.model.get("external_lib", None))
+
+        # Set actor_module_fsdp to None - fsdp_version() will return 0,
+        # skipping FSDP state_dict configuration in _build_rollout()
+        self.actor_module_fsdp = None
+
+        # Only build rollout engine, skip FSDP model loading
+        self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+
+    async def rollout_mode(self):
+        """Override rollout_mode to skip FSDP weight syncing.
+
+        In one_step_off_policy mode, weights are synced via sync_rollout_weights()
+        using collective broadcast, not from a local FSDP model.
+        """
+        # No-op: weights are synced via sync_rollout_weights() instead
+        pass
+
+    async def trainer_mode(self):
+        """Override trainer_mode to skip FSDP-related operations.
+
+        In one_step_off_policy mode, there's no local FSDP model on rollout workers.
+        """
+        # No-op: no local FSDP model to switch to trainer mode
+        pass
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_actor_weights_info(self, weights_info):
         assert self._is_rollout
         self._weights_info = weights_info
