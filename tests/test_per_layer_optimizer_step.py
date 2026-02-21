@@ -16,9 +16,7 @@
 Tests correctness of per-layer GPU optimizer step against baseline CPU/GPU optimizer.step().
 Uses mp.spawn pattern from test_activation_offload.py.
 """
-import copy
 import os
-import tempfile
 
 import pytest
 import torch
@@ -125,63 +123,27 @@ def _test_layer_grouping_worker(rank, world_size, rendezvous_file):
 
 
 # =============================================================================
-# Test 2: Correctness - CPU offload mode
+# Test 2: CPUOffloadPolicy raises ValueError
 # =============================================================================
-def _test_correctness_cpu_offload_worker(rank, world_size, rendezvous_file):
+def _test_cpuoffload_raises_error_worker(rank, world_size, rendezvous_file):
     device_mesh = _setup_distributed(rank, world_size, rendezvous_file)
     config = _create_tiny_config()
 
-    # --- Baseline: standard optimizer.step() on CPU (with CPUOffloadPolicy) ---
-    torch.manual_seed(42)
-    model_baseline = _create_model_and_fsdp(config, device_mesh, use_cpu_offload=True)
-    optimizer_baseline = torch.optim.AdamW(model_baseline.parameters(), lr=1e-3)
+    model = _create_model_and_fsdp(config, device_mesh, use_cpu_offload=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
-    torch.manual_seed(100 + rank)
-    input_ids = torch.randint(0, config.vocab_size, (2, 32), device=f"cuda:{rank}")
+    # PerLayerGPUOptimizerStep requires params on GPU; CPUOffloadPolicy puts them on CPU
+    raised = False
+    try:
+        PerLayerGPUOptimizerStep(model, optimizer, device_id=rank)
+    except ValueError as e:
+        raised = True
+        if rank == 0:
+            print(f"Correctly raised ValueError: {e}")
 
-    loss = model_baseline(input_ids=input_ids).logits.mean()
-    loss.backward()
-    fsdp2_clip_grad_norm_(model_baseline.parameters(), max_norm=1.0)
-    optimizer_baseline.step()
-    optimizer_baseline.zero_grad()
+    assert raised, "Expected ValueError when using CPUOffloadPolicy with PerLayerGPUOptimizerStep"
 
-    # Collect baseline param values
-    baseline_params = {}
-    for n, p in model_baseline.named_parameters():
-        local = p._local_tensor if hasattr(p, "_local_tensor") else p
-        baseline_params[n] = local.detach().float().cpu().clone()
-
-    del model_baseline, optimizer_baseline
-    torch.cuda.empty_cache()
-
-    # --- Per-layer GPU optimizer step ---
-    torch.manual_seed(42)
-    model_perlayer = _create_model_and_fsdp(config, device_mesh, use_cpu_offload=True)
-    optimizer_perlayer = torch.optim.AdamW(model_perlayer.parameters(), lr=1e-3)
-
-    torch.manual_seed(100 + rank)
-    input_ids = torch.randint(0, config.vocab_size, (2, 32), device=f"cuda:{rank}")
-
-    loss = model_perlayer(input_ids=input_ids).logits.mean()
-    loss.backward()
-    fsdp2_clip_grad_norm_(model_perlayer.parameters(), max_norm=1.0)
-    stepper = PerLayerGPUOptimizerStep(model_perlayer, optimizer_perlayer, device_id=rank, prefetch_layers=1)
-    stepper.step()
-    optimizer_perlayer.zero_grad()
-
-    # Compare — CPU vs GPU Adam will have bf16 rounding differences, use relaxed threshold
-    max_diff = 0.0
-    for n, p in model_perlayer.named_parameters():
-        local = p._local_tensor if hasattr(p, "_local_tensor") else p
-        perlayer_val = local.detach().float().cpu()
-        diff = (perlayer_val - baseline_params[n]).abs().max().item()
-        max_diff = max(max_diff, diff)
-        assert diff < 1e-2, f"Param {n} diff={diff:.6e} exceeds threshold"
-
-    if rank == 0:
-        print(f"CPU offload correctness test passed. Max diff: {max_diff:.6e}")
-
-    del model_perlayer, optimizer_perlayer
+    del model, optimizer
     dist.destroy_process_group()
 
 
@@ -258,8 +220,16 @@ def _test_multi_step_worker(rank, world_size, rendezvous_file):
     device_mesh = _setup_distributed(rank, world_size, rendezvous_file)
     config = _create_tiny_config()
 
-    model = _create_model_and_fsdp(config, device_mesh, use_cpu_offload=True)
+    model = _create_model_and_fsdp(config, device_mesh, use_cpu_offload=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    # Offload optimizer states to CPU (simulates optimizer_offload=True)
+    from verl.utils.fsdp_utils import offload_fsdp_optimizer
+    offload_fsdp_optimizer(optimizer)
+    torch.cuda.synchronize()
+
+    # Create stepper once and reuse across steps (same as production code)
+    stepper = PerLayerGPUOptimizerStep(model, optimizer, device_id=rank, prefetch_layers=1)
 
     losses = []
     for step in range(3):
@@ -269,7 +239,6 @@ def _test_multi_step_worker(rank, world_size, rendezvous_file):
         loss.backward()
         fsdp2_clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-        stepper = PerLayerGPUOptimizerStep(model, optimizer, device_id=rank, prefetch_layers=1)
         stepper.step()
         optimizer.zero_grad()
         losses.append(loss.item())
@@ -287,8 +256,13 @@ def _test_prefetch_layers_worker(rank, world_size, rendezvous_file, prefetch_lay
     device_mesh = _setup_distributed(rank, world_size, rendezvous_file)
     config = _create_tiny_config()
 
-    model = _create_model_and_fsdp(config, device_mesh, use_cpu_offload=True)
+    model = _create_model_and_fsdp(config, device_mesh, use_cpu_offload=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    # Offload optimizer states to CPU
+    from verl.utils.fsdp_utils import offload_fsdp_optimizer
+    offload_fsdp_optimizer(optimizer)
+    torch.cuda.synchronize()
 
     torch.manual_seed(42 + rank)
     input_ids = torch.randint(0, config.vocab_size, (2, 32), device=f"cuda:{rank}")
@@ -330,10 +304,10 @@ def test_layer_grouping(world_size, tmp_path):
 
 
 @pytest.mark.parametrize("world_size", [2])
-def test_correctness_cpu_offload(world_size, tmp_path):
+def test_cpuoffload_raises_error(world_size, tmp_path):
     rendezvous_file = str(tmp_path / "rdzv_file")
     mp.spawn(
-        fn=_test_correctness_cpu_offload_worker,
+        fn=_test_cpuoffload_raises_error_worker,
         args=(world_size, rendezvous_file),
         nprocs=world_size,
         join=True,

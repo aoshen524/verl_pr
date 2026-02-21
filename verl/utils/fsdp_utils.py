@@ -899,9 +899,11 @@ class PerLayerGPUOptimizerStep:
     Instead of running Adam on CPU for all ~67GB of optimizer states,
     streams 1-2 layers at a time (~1.5GB each) to GPU, achieving ~50-80x speedup.
 
-    Works with both:
-    - CPUOffloadPolicy (all tensors on CPU after backward)
-    - param_offload only (params/grads on GPU, optimizer states on CPU)
+    Requires:
+    - optimizer_offload=True (optimizer states reside on CPU between steps)
+    - offload_policy=False (params and grads MUST remain on GPU)
+
+    If CPUOffloadPolicy is used (params/grads offloaded to CPU), raise ValueError.
     """
 
     def __init__(self, model, optimizer, device_id, prefetch_layers=1):
@@ -909,7 +911,14 @@ class PerLayerGPUOptimizerStep:
         self.device = torch.device(f"cuda:{device_id}") if isinstance(device_id, int) else torch.device(device_id)
         self.prefetch_layers = prefetch_layers
         self._layer_param_groups = self._build_layer_groups(model)
+        self._validate_gpu_params()
         self._init_states_and_pin()
+        # Persistent CUDA streams — reused across step() calls
+        self.h2d_stream = torch.cuda.Stream(device=self.device)
+        self.d2h_stream = torch.cuda.Stream(device=self.device)
+        # Detect AdamW for decoupled weight decay
+        self._decoupled_weight_decay = isinstance(optimizer, torch.optim.AdamW)
+        self.last_step_metrics = {}
 
     def _build_layer_groups(self, model) -> list:
         """Group params by FSDP2-wrapped sub-modules (excluding root).
@@ -918,7 +927,6 @@ class PerLayerGPUOptimizerStep:
         FSDPModule. We find all non-root FSDPModule instances and group their
         params. Any remaining params (final norm, lm_head) form a residual group.
         """
-        # Find non-root FSDP-wrapped modules (same modules that apply_fsdp2 wraps)
         fsdp_children = []
         for name, module in model.named_modules():
             if name and isinstance(module, FSDPModule):
@@ -943,20 +951,27 @@ class PerLayerGPUOptimizerStep:
         """Extract regular tensor from DTensor, or return as-is."""
         return t._local_tensor if hasattr(t, "_local_tensor") else t
 
+    def _validate_gpu_params(self):
+        """Verify all params are on GPU (not CPU-offloaded via CPUOffloadPolicy)."""
+        for group in self._layer_param_groups:
+            for param in group:
+                local_p = self._get_local_tensor(param.data)
+                if local_p.device.type != "cuda":
+                    raise ValueError(
+                        f"PerLayerGPUOptimizerStep requires params on GPU, "
+                        f"but found param on {local_p.device}. "
+                        f"Disable offload_policy (CPUOffloadPolicy) when using "
+                        f"per_layer_optimizer_step."
+                    )
+
     def _init_states_and_pin(self):
         """Pre-initialize optimizer states on CPU and pin them for async H2D/D2H.
 
         Without pinning, .to(non_blocking=True) on CPU tensors is synchronous,
         killing all pipeline overlap. Pinning enables true async DMA transfers.
 
-        IMPORTANT: States must be created on CPU regardless of current param device.
-        When param_offload=True, params are loaded to GPU before this is called,
-        so zeros_like(param) would create states on GPU (~31GB for 32B model),
-        causing OOM during forward/backward. We explicitly create on CPU and
-        stream per-layer during optimizer step.
-
-        Called from __init__ (before backward), so we init states for ALL
-        trainable params regardless of whether they have gradients yet.
+        States must be created on CPU explicitly — NOT zeros_like(param) which
+        would follow param's device (GPU), causing OOM for large models.
         """
         for group in self._layer_param_groups:
             for param in group:
@@ -964,8 +979,6 @@ class PerLayerGPUOptimizerStep:
                     continue
                 state = self.optimizer.state[param]
                 if len(state) == 0:
-                    # Create states on CPU explicitly — NOT zeros_like(param) which
-                    # would follow param's device (potentially GPU after load_fsdp_model_to_gpu).
                     local_p = self._get_local_tensor(param.data)
                     state["step"] = torch.tensor(0.0, dtype=torch.float32)
                     state["exp_avg"] = torch.zeros(
@@ -975,14 +988,14 @@ class PerLayerGPUOptimizerStep:
                         local_p.shape, dtype=local_p.dtype, device="cpu"
                     )
                 else:
-                    # States already exist (from previous training step).
-                    # Ensure they are on CPU — they might be on GPU if a previous
-                    # non-per-layer optimizer.step() created them there.
                     for key in ("exp_avg", "exp_avg_sq"):
                         if key in state:
                             local = self._get_local_tensor(state[key])
                             if local.device.type != "cpu":
                                 state[key] = local.to("cpu")
+                    # Handle state['step'] being a Python float/int (some Adam variants)
+                    if "step" in state and not isinstance(state["step"], torch.Tensor):
+                        state["step"] = torch.tensor(float(state["step"]), dtype=torch.float32)
                 # Pin optimizer state tensors for async transfers
                 for key in ("exp_avg", "exp_avg_sq", "step"):
                     local = self._get_local_tensor(state[key])
@@ -990,45 +1003,36 @@ class PerLayerGPUOptimizerStep:
                         local.data = local.pin_memory()
 
     def _prefetch_layer(self, layer_idx):
-        """H2D: copy layer's optimizer states (and params/grads if on CPU) to GPU.
+        """H2D: copy layer's optimizer states to GPU.
 
-        Auto-detects tensor device: skips H2D for tensors already on GPU.
-        States are already initialized and pinned by _init_states_and_pin().
+        Params and grads are already on GPU — only optimizer states
+        (exp_avg, exp_avg_sq, step) need H2D transfer from pinned CPU memory.
         """
         result = {}
         for param in self._layer_param_groups[layer_idx]:
             if param.grad is None:
                 continue
             state = self.optimizer.state[param]
-            local_p = self._get_local_tensor(param.data)
-            local_g = self._get_local_tensor(param.grad.data)
             local_m = self._get_local_tensor(state["exp_avg"])
             local_v = self._get_local_tensor(state["exp_avg_sq"])
 
-            def _to_gpu(t, device=self.device):
-                return t if t.device == device else t.to(device, non_blocking=True)
-
-            p_on_gpu = local_p.device == self.device
-
             result[id(param)] = {
-                "param": param,
                 "state": state,
-                "p_was_cpu": not p_on_gpu,
-                "cpu_p": local_p,
-                "cpu_m": local_m,
+                "gpu_p": self._get_local_tensor(param.data),  # already on GPU
+                "gpu_g": self._get_local_tensor(param.grad.data),  # already on GPU
+                "gpu_m": local_m.to(self.device, non_blocking=True),
+                "gpu_v": local_v.to(self.device, non_blocking=True),
+                "gpu_step": state["step"].to(self.device, non_blocking=True),
+                "cpu_m": local_m,  # pinned CPU tensors for D2H
                 "cpu_v": local_v,
-                "gpu_p": _to_gpu(local_p),
-                "gpu_g": _to_gpu(local_g),
-                "gpu_m": _to_gpu(local_m),
-                "gpu_v": _to_gpu(local_v),
-                "gpu_step": state["step"].to(self.device, non_blocking=True)
-                if not state["step"].is_cuda
-                else state["step"],
             }
         return result
 
     def _run_adam_for_layer(self, gpu_states):
-        """Call torch.optim.adam.adam() functional API on GPU tensors."""
+        """Call torch.optim.adam.adam() functional API on GPU tensors.
+
+        Params are updated in-place on GPU (no need to copy back).
+        """
         from torch.optim.adam import adam
 
         group = self.optimizer.param_groups[0]
@@ -1063,23 +1067,19 @@ class PerLayerGPUOptimizerStep:
             fused=None,
             grad_scale=None,
             found_inf=None,
-            decoupled_weight_decay=group.get("decoupled_weight_decay", False),
+            decoupled_weight_decay=self._decoupled_weight_decay,
         )
 
     def _offload_layer(self, gpu_states):
-        """D2H: copy updated param data + optimizer states back to CPU.
+        """D2H: copy updated optimizer states back to pinned CPU memory.
 
-        Only copies back tensors that were originally on CPU.
-        CPU destination tensors are pinned, enabling async D2H via non_blocking.
+        Params are already updated in-place on GPU by Adam — no param D2H needed.
+        Only optimizer states (exp_avg, exp_avg_sq, step) are copied back.
         """
         for buf in gpu_states.values():
-            if buf["p_was_cpu"]:
-                buf["cpu_p"].copy_(buf["gpu_p"], non_blocking=True)
             buf["cpu_m"].copy_(buf["gpu_m"], non_blocking=True)
             buf["cpu_v"].copy_(buf["gpu_v"], non_blocking=True)
-            state = buf["state"]
-            if isinstance(state["step"], torch.Tensor):
-                state["step"].copy_(buf["gpu_step"], non_blocking=True)
+            buf["state"]["step"].copy_(buf["gpu_step"], non_blocking=True)
 
     @torch.no_grad()
     def step(self):
@@ -1099,9 +1099,10 @@ class PerLayerGPUOptimizerStep:
         import time
 
         t_start = time.perf_counter()
+        torch.cuda.reset_peak_memory_stats(self.device)
 
-        h2d_stream = torch.cuda.Stream(device=self.device)
-        d2h_stream = torch.cuda.Stream(device=self.device)
+        h2d_stream = self.h2d_stream
+        d2h_stream = self.d2h_stream
         compute_stream = torch.cuda.current_stream(self.device)
         num_groups = len(self._layer_param_groups)
         gpu_states = [None] * num_groups

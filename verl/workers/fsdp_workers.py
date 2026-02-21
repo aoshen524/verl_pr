@@ -992,13 +992,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Set up per-layer GPU optimizer step or load all optimizer states
         _use_per_layer = self.config.actor.fsdp_config.get("per_layer_optimizer_step", False)
         if _use_per_layer:
-            stepper = PerLayerGPUOptimizerStep(
-                model=self.actor_module_fsdp,
-                optimizer=self.actor_optimizer,
-                device_id=get_device_id(),
-                prefetch_layers=self.config.actor.fsdp_config.get("optimizer_step_prefetch_layers", 1),
-            )
-            self.actor._per_layer_optimizer_stepper = stepper
+            if self.config.actor.fsdp_config.get("offload_policy", False):
+                raise ValueError(
+                    "per_layer_optimizer_step requires offload_policy=False. "
+                    "CPUOffloadPolicy moves params/grads to CPU which is incompatible "
+                    "with per-layer GPU optimizer step. Use optimizer_offload=True instead."
+                )
+            # Cache stepper: reuse across update_actor() calls to avoid
+            # repeated module scanning, param grouping, and memory pinning.
+            if self.actor._per_layer_optimizer_stepper is None:
+                self.actor._per_layer_optimizer_stepper = PerLayerGPUOptimizerStep(
+                    model=self.actor_module_fsdp,
+                    optimizer=self.actor_optimizer,
+                    device_id=get_device_id(),
+                    prefetch_layers=self.config.actor.fsdp_config.get("optimizer_step_prefetch_layers", 1),
+                )
         elif self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
 
@@ -1029,11 +1037,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             output = DataProto(meta_info={"metrics": metrics})
 
             output = output.to("cpu")
-
-        # Clean up per-layer stepper
-        if _use_per_layer:
-            self.actor._per_layer_optimizer_stepper = None
-            torch.cuda.empty_cache()
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
