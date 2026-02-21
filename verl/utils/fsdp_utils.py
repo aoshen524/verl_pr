@@ -907,17 +907,21 @@ class PerLayerGPUOptimizerStep:
     """
 
     def __init__(self, model, optimizer, device_id, prefetch_layers=1):
+        if not isinstance(optimizer, torch.optim.AdamW):
+            raise TypeError(
+                f"PerLayerGPUOptimizerStep only supports AdamW optimizer, "
+                f"got {type(optimizer).__name__}."
+            )
         self.optimizer = optimizer
         self.device = torch.device(f"cuda:{device_id}") if isinstance(device_id, int) else torch.device(device_id)
         self.prefetch_layers = prefetch_layers
         self._layer_param_groups = self._build_layer_groups(model)
         self._validate_gpu_params()
+        self._validate_single_hyperparam_set()
         self._init_states_and_pin()
         # Persistent CUDA streams — reused across step() calls
         self.h2d_stream = torch.cuda.Stream(device=self.device)
         self.d2h_stream = torch.cuda.Stream(device=self.device)
-        # Detect AdamW for decoupled weight decay
-        self._decoupled_weight_decay = isinstance(optimizer, torch.optim.AdamW)
         self.last_step_metrics = {}
 
     def _build_layer_groups(self, model) -> list:
@@ -964,6 +968,27 @@ class PerLayerGPUOptimizerStep:
                         f"per_layer_optimizer_step."
                     )
 
+    def _validate_single_hyperparam_set(self):
+        """Assert all param_groups share identical hyperparameters.
+
+        PerLayerGPUOptimizerStep processes params by layer (not by group),
+        so all groups must have the same hyperparams. Fails loudly if not.
+        """
+        if len(self.optimizer.param_groups) <= 1:
+            return
+        ref = self.optimizer.param_groups[0]
+        keys = ["lr", "betas", "eps", "weight_decay", "amsgrad", "maximize",
+                "foreach", "capturable", "differentiable", "fused",
+                "decoupled_weight_decay"]
+        for i, group in enumerate(self.optimizer.param_groups[1:], 1):
+            for key in keys:
+                if group[key] != ref[key]:
+                    raise ValueError(
+                        f"PerLayerGPUOptimizerStep requires all param_groups to have "
+                        f"identical hyperparameters, but group[{i}]['{key}']={group[key]} "
+                        f"differs from group[0]['{key}']={ref[key]}."
+                    )
+
     def _init_states_and_pin(self):
         """Pre-initialize optimizer states on CPU and pin them for async H2D/D2H.
 
@@ -993,9 +1018,6 @@ class PerLayerGPUOptimizerStep:
                             local = self._get_local_tensor(state[key])
                             if local.device.type != "cpu":
                                 state[key] = local.to("cpu")
-                    # Handle state['step'] being a Python float/int (some Adam variants)
-                    if "step" in state and not isinstance(state["step"], torch.Tensor):
-                        state["step"] = torch.tensor(float(state["step"]), dtype=torch.float32)
                 # Pin optimizer state tensors for async transfers
                 for key in ("exp_avg", "exp_avg_sq", "step"):
                     local = self._get_local_tensor(state[key])
@@ -1031,14 +1053,17 @@ class PerLayerGPUOptimizerStep:
     def _run_adam_for_layer(self, gpu_states):
         """Call torch.optim.adam.adam() functional API on GPU tensors.
 
-        Params are updated in-place on GPU (no need to copy back).
+        Mirrors Adam.step() (adam.py:248-270): reads all hyperparams from group dict.
+        All param_groups guaranteed identical by _validate_single_hyperparam_set().
         """
         from torch.optim.adam import adam
 
         group = self.optimizer.param_groups[0]
         beta1, beta2 = group["betas"]
         params, grads, exp_avgs, exp_avg_sqs, steps = [], [], [], [], []
+        has_complex = False
         for buf in gpu_states.values():
+            has_complex |= torch.is_complex(buf["gpu_p"])
             params.append(buf["gpu_p"])
             grads.append(buf["gpu_g"])
             exp_avgs.append(buf["gpu_m"])
@@ -1053,21 +1078,21 @@ class PerLayerGPUOptimizerStep:
             exp_avg_sqs,
             [],  # max_exp_avg_sqs (empty for non-amsgrad)
             steps,
-            amsgrad=group.get("amsgrad", False),
-            has_complex=False,
+            amsgrad=group["amsgrad"],
+            has_complex=has_complex,
             beta1=beta1,
             beta2=beta2,
             lr=group["lr"],
             weight_decay=group["weight_decay"],
-            eps=group.get("eps", 1e-8),
-            maximize=group.get("maximize", False),
-            foreach=True,
-            capturable=False,
-            differentiable=False,
-            fused=None,
-            grad_scale=None,
-            found_inf=None,
-            decoupled_weight_decay=self._decoupled_weight_decay,
+            eps=group["eps"],
+            maximize=group["maximize"],
+            foreach=group["foreach"],
+            capturable=group["capturable"],
+            differentiable=group["differentiable"],
+            fused=group["fused"],
+            grad_scale=getattr(self.optimizer, "grad_scale", None),
+            found_inf=getattr(self.optimizer, "found_inf", None),
+            decoupled_weight_decay=group["decoupled_weight_decay"],
         )
 
     def _offload_layer(self, gpu_states):
