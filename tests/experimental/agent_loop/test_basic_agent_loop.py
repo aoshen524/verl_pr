@@ -23,7 +23,7 @@ from transformers.utils import get_json_schema
 
 from tests.experimental.agent_loop.agent_utils import init_agent_loop_manager
 from verl.checkpoint_engine import CheckpointEngineManager
-from verl.experimental.agent_loop.agent_loop import get_trajectory_info
+from verl.experimental.agent_loop.agent_loop import GlobalRequestLoadBalancer, get_trajectory_info
 from verl.protocol import DataProto
 from verl.tools.base_tool import BaseTool, OpenAIFunctionToolSchema
 from verl.tools.schemas import ToolResponse
@@ -448,3 +448,101 @@ async def test_get_trajectory_info():
     trajectory_info = await get_trajectory_info(step, index, validate=False)
 
     assert trajectory_info == expected_info
+
+
+# ──────────────────────────────────────────────────────────────────────
+# GlobalRequestLoadBalancer unit tests (lightweight, no GPU required)
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def ray_for_lb():
+    ray.init(ignore_reinit_error=True)
+    yield
+    ray.shutdown()
+
+
+class TestLoadBalancerRouting:
+    """Least-loaded selection with round-robin tie-breaking."""
+
+    def test_round_robin_on_equal_load(self, ray_for_lb):
+        lb = GlobalRequestLoadBalancer.remote(num_servers=3)
+        servers = [ray.get(lb.acquire_server.remote(request_id=f"r{i}")) for i in range(3)]
+        assert sorted(servers) == [0, 1, 2]
+
+    def test_new_requests_avoid_loaded_server(self, ray_for_lb):
+        lb = GlobalRequestLoadBalancer.remote(num_servers=2)
+        s0 = ray.get(lb.acquire_server.remote(request_id="a", group_key="heavy"))
+        ray.get(lb.acquire_server.remote(request_id="b", group_key="heavy"))
+        ray.get(lb.acquire_server.remote(request_id="c", group_key="heavy"))
+        s_new = ray.get(lb.acquire_server.remote(request_id="d"))
+        assert s_new != s0
+
+    def test_release_rebalances(self, ray_for_lb):
+        lb = GlobalRequestLoadBalancer.remote(num_servers=2)
+        s0 = ray.get(lb.acquire_server.remote(request_id="r0"))
+        s1 = ray.get(lb.acquire_server.remote(request_id="r1"))
+        assert s0 != s1
+        ray.get(lb.release_server.remote(server_idx=s0))
+        ray.get(lb.release_server.remote(server_idx=s1))
+        s2 = ray.get(lb.acquire_server.remote(request_id="r2"))
+        s3 = ray.get(lb.acquire_server.remote(request_id="r3"))
+        assert s2 != s3
+
+
+class TestLoadBalancerStickySession:
+    """Request-level sticky session."""
+
+    def test_same_request_id_same_server(self, ray_for_lb):
+        lb = GlobalRequestLoadBalancer.remote(num_servers=4)
+        s0 = ray.get(lb.acquire_server.remote(request_id="conv-abc"))
+        ray.get(lb.release_server.remote(server_idx=s0))
+        s1 = ray.get(lb.acquire_server.remote(request_id="conv-abc"))
+        assert s0 == s1
+
+    def test_request_sticky_takes_priority_over_group(self, ray_for_lb):
+        lb = GlobalRequestLoadBalancer.remote(num_servers=4)
+        s0 = ray.get(lb.acquire_server.remote(request_id="r1"))
+        ray.get(lb.release_server.remote(server_idx=s0))
+        ray.get(lb.acquire_server.remote(request_id="r2", group_key="other-group"))
+        s1 = ray.get(lb.acquire_server.remote(request_id="r1", group_key="other-group"))
+        assert s1 == s0
+
+
+class TestLoadBalancerGroupAffinity:
+    """GRPO group affinity for prefix cache sharing."""
+
+    def test_same_group_same_server(self, ray_for_lb):
+        lb = GlobalRequestLoadBalancer.remote(num_servers=4)
+        servers = [
+            ray.get(lb.acquire_server.remote(request_id=f"rollout-{i}", group_key="prompt-42"))
+            for i in range(8)
+        ]
+        assert len(set(servers)) == 1
+
+    def test_different_groups_spread(self, ray_for_lb):
+        lb = GlobalRequestLoadBalancer.remote(num_servers=4)
+        group_servers = {}
+        for g in range(4):
+            s = ray.get(lb.acquire_server.remote(request_id=f"g{g}-r0", group_key=f"group-{g}"))
+            ray.get(lb.release_server.remote(server_idx=s))
+            group_servers[g] = s
+        assert len(set(group_servers.values())) == 4
+
+    def test_grpo_simulation(self, ray_for_lb):
+        """4 groups × 8 rollouts across 4 servers: each group colocated, groups spread."""
+        lb = GlobalRequestLoadBalancer.remote(num_servers=4)
+        group_to_server = {}
+        for group_idx in range(4):
+            group_key = f"uid-{group_idx}"
+            for rollout_idx in range(8):
+                s = ray.get(lb.acquire_server.remote(
+                    request_id=f"g{group_idx}-r{rollout_idx}", group_key=group_key,
+                ))
+                if group_key not in group_to_server:
+                    group_to_server[group_key] = s
+                else:
+                    assert s == group_to_server[group_key]
+            for _ in range(8):
+                ray.get(lb.release_server.remote(server_idx=group_to_server[group_key]))
+        assert len(set(group_to_server.values())) == 4

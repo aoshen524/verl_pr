@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import heapq
+import contextvars
 import logging
 import os
 import random
@@ -52,43 +52,155 @@ from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# Per-task group key for GRPO prefix cache affinity.
+# Set in _run_agent_loop, read in AsyncLLMServerManager.generate().
+# asyncio.create_task copies context, so each task has its own value.
+_current_group_key: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "_current_group_key", default=None
+)
+
+
+@ray.remote
+class GlobalRequestLoadBalancer:
+    """Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers."""
+
+    def __init__(self, num_servers: int, max_cache_size: int = 10000):
+        if num_servers <= 0:
+            raise ValueError(f"num_servers must be positive, got {num_servers}")
+
+        self._inflight_requests = [0 for _ in range(num_servers)]
+        self._next_server_idx = 0
+        self._request_id_to_server = LRUCache(maxsize=max_cache_size)
+        self._group_to_server = LRUCache(maxsize=max_cache_size)
+
+    def _select_least_loaded_server_idx(self) -> int:
+        min_inflight = min(self._inflight_requests)
+        num_servers = len(self._inflight_requests)
+        for offset in range(num_servers):
+            candidate_idx = (self._next_server_idx + offset) % num_servers
+            if self._inflight_requests[candidate_idx] == min_inflight:
+                self._next_server_idx = (candidate_idx + 1) % num_servers
+                return candidate_idx
+        raise RuntimeError("Failed to select a server for routing.")
+
+    def acquire_server(self, request_id: str, group_key: str = None) -> int:
+        # 1) request-level sticky (multi-turn: same conversation → same server)
+        if request_id in self._request_id_to_server:
+            server_idx = self._request_id_to_server[request_id]
+            self._inflight_requests[server_idx] += 1
+            return server_idx
+
+        # 2) group-level affinity (single-turn GRPO: same prompt → same server for APC)
+        if group_key is not None and group_key in self._group_to_server:
+            server_idx = self._group_to_server[group_key]
+            self._request_id_to_server[request_id] = server_idx
+            self._inflight_requests[server_idx] += 1
+            return server_idx
+
+        # 3) new request: route to least loaded server
+        server_idx = self._select_least_loaded_server_idx()
+        self._request_id_to_server[request_id] = server_idx
+        if group_key is not None:
+            self._group_to_server[group_key] = server_idx
+        self._inflight_requests[server_idx] += 1
+        return server_idx
+
+    def release_server(self, server_idx: int) -> None:
+        if 0 <= server_idx < len(self._inflight_requests) and self._inflight_requests[server_idx] > 0:
+            self._inflight_requests[server_idx] -= 1
+
 
 class AsyncLLMServerManager:
     """
     A class to manage multiple OpenAI compatible LLM servers. This class provides
-    - Load balance: least requests load balancing
+    - Load balance: least in-flight requests load balancing with optional global coordination
     - Sticky session: send multi-turn chat completions to same server for automatic prefix caching
     """
 
-    def __init__(self, config: DictConfig, server_handles: list[ray.actor.ActorHandle], max_cache_size: int = 10000):
+    def __init__(
+        self,
+        config: DictConfig,
+        server_handles: list[ray.actor.ActorHandle],
+        max_cache_size: int = 10000,
+        load_balancer_handle: Optional[ray.actor.ActorHandle] = None,
+    ):
         """Initialize the AsyncLLMServerManager.
 
         Args:
             config (DictConfig): YAML config.
             server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
             max_cache_size (int, optional): max cache size for request_id to server mapping. Defaults to 10000.
+            load_balancer_handle (Optional[ray.actor.ActorHandle]): shared global load balancer actor.
         """
         self.config = config
-        self.server_handles = server_handles
-        random.shuffle(self.server_handles)
+        self.server_handles = list(server_handles)
+        self._load_balancer = load_balancer_handle
 
-        # Least requests load balancing
-        self.weighted_serveres = [[0, idx, server] for idx, server in enumerate(self.server_handles)]
-        heapq.heapify(self.weighted_serveres)
+        # In global load-balancer mode, server index must map to the same instance on every worker.
+        if self._load_balancer is None:
+            random.shuffle(self.server_handles)
 
-        # LRU cache to map request_id to server
+        # Least in-flight requests load balancing.
+        self._inflight_requests = [0 for _ in self.server_handles]
+        self._next_server_idx = 0
+
+        # LRU cache to map request_id to server index.
         self.request_id_to_server = LRUCache(maxsize=max_cache_size)
 
-    def _choose_server(self, request_id: str) -> ray.actor.ActorHandle:
-        # TODO: implement server pressure awareness load balancing
-        if request_id in self.request_id_to_server:
-            return self.request_id_to_server[request_id]
+    def _select_least_loaded_server_idx(self) -> int:
+        if not self._inflight_requests:
+            raise RuntimeError("No server is available for routing.")
 
-        _, _, server = self.weighted_serveres[0]
-        self.weighted_serveres[0][0] += 1
-        heapq.heapreplace(self.weighted_serveres, self.weighted_serveres[0])
-        self.request_id_to_server[request_id] = server
+        min_inflight = min(self._inflight_requests)
+        num_servers = len(self._inflight_requests)
+        for offset in range(num_servers):
+            candidate_idx = (self._next_server_idx + offset) % num_servers
+            if self._inflight_requests[candidate_idx] == min_inflight:
+                self._next_server_idx = (candidate_idx + 1) % num_servers
+                return candidate_idx
+
+        raise RuntimeError("Failed to select a server for routing.")
+
+    def _choose_server_with_index(self, request_id: str) -> tuple[int, ray.actor.ActorHandle]:
+        if request_id in self.request_id_to_server:
+            server_idx = self.request_id_to_server[request_id]
+            return server_idx, self.server_handles[server_idx]
+
+        server_idx = self._select_least_loaded_server_idx()
+        self.request_id_to_server[request_id] = server_idx
+        return server_idx, self.server_handles[server_idx]
+
+    def _choose_server(self, request_id: str) -> ray.actor.ActorHandle:
+        _, server = self._choose_server_with_index(request_id)
         return server
+
+    async def _acquire_server_with_index(
+        self, request_id: str, group_key: str = None
+    ) -> tuple[int, ray.actor.ActorHandle]:
+        if self._load_balancer is None:
+            server_idx, server = self._choose_server_with_index(request_id)
+            self._inflight_requests[server_idx] += 1
+            return server_idx, server
+
+        server_idx = await self._load_balancer.acquire_server.remote(
+            request_id=request_id, group_key=group_key
+        )
+        if not isinstance(server_idx, int) or not (0 <= server_idx < len(self.server_handles)):
+            # Release the acquired slot before raising to prevent inflight counter leak
+            self._load_balancer.release_server.remote(server_idx=server_idx)
+            raise RuntimeError(f"Invalid server index returned by load balancer: {server_idx}")
+        return server_idx, self.server_handles[server_idx]
+
+    async def _release_server(self, server_idx: Optional[int]) -> None:
+        if server_idx is None:
+            return
+        if self._load_balancer is None:
+            if self._inflight_requests[server_idx] > 0:
+                self._inflight_requests[server_idx] -= 1
+            return
+        # Fire-and-forget: release is just a counter decrement, no need to await.
+        # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
+        self._load_balancer.release_server.remote(server_idx=server_idx)
 
     @rollout_trace_op
     async def generate(
@@ -110,15 +222,20 @@ class AsyncLLMServerManager:
         Returns:
             TokenOutput: token output
         """
-        server = self._choose_server(request_id)
-        output = await server.generate.remote(
-            request_id=uuid4().hex,  # use new request_id for each turn
-            prompt_ids=prompt_ids,
-            sampling_params=sampling_params,
-            image_data=image_data,
-            video_data=video_data,
-        )
-        return output
+        server_idx = None
+        group_key = _current_group_key.get(None)
+        try:
+            server_idx, server = await self._acquire_server_with_index(request_id, group_key=group_key)
+            output = await server.generate.remote(
+                request_id=uuid4().hex,  # use new request_id for each turn
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                video_data=video_data,
+            )
+            return output
+        finally:
+            await self._release_server(server_idx)
 
 
 class AgentLoopMetrics(BaseModel):
@@ -349,18 +466,24 @@ class AgentLoopWorker:
         config: DictConfig,
         server_handles: list[ray.actor.ActorHandle],
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        load_balancer_handle: Optional[ray.actor.ActorHandle] = None,
     ):
         """Initialize agent loop manager.
         Args:
             config (DictConfig): YAML config.
             server_handles (List[ray.actor.ActorHandle]): OpenAI compatible LLM server actor handles.
             reward_loop_worker_handles (List[ray.actor.ActorHandle]): Actor handles for streaming reward computation.
+            load_balancer_handle (Optional[ray.actor.ActorHandle]): shared global load balancer actor.
         """
         self.config = config
 
         # for recipe to change
         if not hasattr(self, "server_manager"):
-            self.server_manager = AsyncLLMServerManager(config, server_handles)
+            self.server_manager = AsyncLLMServerManager(
+                config,
+                server_handles,
+                load_balancer_handle=load_balancer_handle,
+            )
 
         self.dataset_cls = get_dataset_class(config.data)
         self.reward_loop_worker_handles = reward_loop_worker_handles
@@ -495,6 +618,15 @@ class AgentLoopWorker:
             )
 
             agent_loop_config = _agent_loop_registry[agent_name]
+
+            # When multi_turn is disabled, all GRPO rollouts of the same prompt (uid)
+            # share the identical token prefix. Setting _current_group_key routes them
+            # to the same vLLM server for automatic prefix caching (APC).
+            multi_turn_cfg = getattr(self.config.actor_rollout_ref.rollout, "multi_turn", {})
+            multi_turn_enabled = getattr(multi_turn_cfg, "enable", False)
+            uid = kwargs.get("uid")
+            _current_group_key.set(str(uid) if not multi_turn_enabled and uid is not None else None)
+
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
                 trainer_config=DictConfigWrap(config=self.config),
@@ -874,6 +1006,7 @@ class AgentLoopManager:
             self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
 
         self._initialize_llm_servers(rollout_resource_pool)
+        self._init_global_load_balancer()
         self._init_agent_loop_workers()
 
     def _initialize_llm_servers(self, rollout_resource_pool: RayResourcePool):
@@ -927,6 +1060,7 @@ class AgentLoopManager:
     def _init_agent_loop_workers(self):
         self.agent_loop_workers = []
         num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
+        load_balancer_handle = getattr(self, "global_load_balancer", None)
 
         node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
         for i in range(num_workers):
@@ -938,8 +1072,20 @@ class AgentLoopManager:
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id, soft=True
                     ),
-                ).remote(self.config, self.server_handles, self.reward_loop_worker_handles)
+                ).remote(
+                    self.config,
+                    self.server_handles,
+                    self.reward_loop_worker_handles,
+                    load_balancer_handle,
+                )
             )
+
+    def _init_global_load_balancer(self) -> None:
+        max_cache_size = 10000
+        self.global_load_balancer = GlobalRequestLoadBalancer.remote(
+            num_servers=len(self.server_handles),
+            max_cache_size=max_cache_size,
+        )
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
