@@ -52,12 +52,10 @@ from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-# Per-task group key for GRPO prefix cache affinity.
+# Per-task uid for GRPO prefix cache affinity.
 # Set in _run_agent_loop, read in AsyncLLMServerManager.generate().
 # asyncio.create_task copies context, so each task has its own value.
-_current_group_key: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    "_current_group_key", default=None
-)
+_current_uid: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("_current_uid", default=None)
 
 
 @ray.remote
@@ -71,7 +69,7 @@ class GlobalRequestLoadBalancer:
         self._inflight_requests = [0 for _ in range(num_servers)]
         self._next_server_idx = 0
         self._request_id_to_server = LRUCache(maxsize=max_cache_size)
-        self._group_to_server = LRUCache(maxsize=max_cache_size)
+        self._uid_to_server = LRUCache(maxsize=max_cache_size)
 
     def _select_least_loaded_server_idx(self) -> int:
         min_inflight = min(self._inflight_requests)
@@ -83,16 +81,16 @@ class GlobalRequestLoadBalancer:
                 return candidate_idx
         raise RuntimeError("Failed to select a server for routing.")
 
-    def acquire_server(self, request_id: str, group_key: str = None) -> int:
+    def acquire_server(self, request_id: str, uid: str = None) -> int:
         # 1) request-level sticky (multi-turn: same conversation → same server)
         if request_id in self._request_id_to_server:
             server_idx = self._request_id_to_server[request_id]
             self._inflight_requests[server_idx] += 1
             return server_idx
 
-        # 2) group-level affinity (single-turn GRPO: same prompt → same server for APC)
-        if group_key is not None and group_key in self._group_to_server:
-            server_idx = self._group_to_server[group_key]
+        # 2) uid-level affinity (single-turn GRPO: same prompt uid → same server for APC)
+        if uid is not None and uid in self._uid_to_server:
+            server_idx = self._uid_to_server[uid]
             self._request_id_to_server[request_id] = server_idx
             self._inflight_requests[server_idx] += 1
             return server_idx
@@ -100,8 +98,8 @@ class GlobalRequestLoadBalancer:
         # 3) new request: route to least loaded server
         server_idx = self._select_least_loaded_server_idx()
         self._request_id_to_server[request_id] = server_idx
-        if group_key is not None:
-            self._group_to_server[group_key] = server_idx
+        if uid is not None:
+            self._uid_to_server[uid] = server_idx
         self._inflight_requests[server_idx] += 1
         return server_idx
 
@@ -174,17 +172,13 @@ class AsyncLLMServerManager:
         _, server = self._choose_server_with_index(request_id)
         return server
 
-    async def _acquire_server_with_index(
-        self, request_id: str, group_key: str = None
-    ) -> tuple[int, ray.actor.ActorHandle]:
+    async def _acquire_server_with_index(self, request_id: str, uid: str = None) -> tuple[int, ray.actor.ActorHandle]:
         if self._load_balancer is None:
             server_idx, server = self._choose_server_with_index(request_id)
             self._inflight_requests[server_idx] += 1
             return server_idx, server
 
-        server_idx = await self._load_balancer.acquire_server.remote(
-            request_id=request_id, group_key=group_key
-        )
+        server_idx = await self._load_balancer.acquire_server.remote(request_id=request_id, uid=uid)
         if not isinstance(server_idx, int) or not (0 <= server_idx < len(self.server_handles)):
             # Release the acquired slot before raising to prevent inflight counter leak
             self._load_balancer.release_server.remote(server_idx=server_idx)
@@ -223,9 +217,9 @@ class AsyncLLMServerManager:
             TokenOutput: token output
         """
         server_idx = None
-        group_key = _current_group_key.get(None)
+        uid = _current_uid.get(None)
         try:
-            server_idx, server = await self._acquire_server_with_index(request_id, group_key=group_key)
+            server_idx, server = await self._acquire_server_with_index(request_id, uid=uid)
             output = await server.generate.remote(
                 request_id=uuid4().hex,  # use new request_id for each turn
                 prompt_ids=prompt_ids,
@@ -620,12 +614,12 @@ class AgentLoopWorker:
             agent_loop_config = _agent_loop_registry[agent_name]
 
             # When multi_turn is disabled, all GRPO rollouts of the same prompt (uid)
-            # share the identical token prefix. Setting _current_group_key routes them
+            # share the identical token prefix. Setting _current_uid routes them
             # to the same vLLM server for automatic prefix caching (APC).
             multi_turn_cfg = getattr(self.config.actor_rollout_ref.rollout, "multi_turn", {})
             multi_turn_enabled = getattr(multi_turn_cfg, "enable", False)
             uid = kwargs.get("uid")
-            _current_group_key.set(str(uid) if not multi_turn_enabled and uid is not None else None)
+            _current_uid.set(str(uid) if not multi_turn_enabled and uid is not None else None)
 
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,

@@ -472,9 +472,9 @@ class TestLoadBalancerRouting:
 
     def test_new_requests_avoid_loaded_server(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(num_servers=2)
-        s0 = ray.get(lb.acquire_server.remote(request_id="a", group_key="heavy"))
-        ray.get(lb.acquire_server.remote(request_id="b", group_key="heavy"))
-        ray.get(lb.acquire_server.remote(request_id="c", group_key="heavy"))
+        s0 = ray.get(lb.acquire_server.remote(request_id="a", uid="heavy"))
+        ray.get(lb.acquire_server.remote(request_id="b", uid="heavy"))
+        ray.get(lb.acquire_server.remote(request_id="c", uid="heavy"))
         s_new = ray.get(lb.acquire_server.remote(request_id="d"))
         assert s_new != s0
 
@@ -500,49 +500,49 @@ class TestLoadBalancerStickySession:
         s1 = ray.get(lb.acquire_server.remote(request_id="conv-abc"))
         assert s0 == s1
 
-    def test_request_sticky_takes_priority_over_group(self, ray_for_lb):
+    def test_request_sticky_takes_priority_over_uid(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(num_servers=4)
         s0 = ray.get(lb.acquire_server.remote(request_id="r1"))
         ray.get(lb.release_server.remote(server_idx=s0))
-        ray.get(lb.acquire_server.remote(request_id="r2", group_key="other-group"))
-        s1 = ray.get(lb.acquire_server.remote(request_id="r1", group_key="other-group"))
+        ray.get(lb.acquire_server.remote(request_id="r2", uid="other-uid"))
+        s1 = ray.get(lb.acquire_server.remote(request_id="r1", uid="other-uid"))
         assert s1 == s0
 
 
-class TestLoadBalancerGroupAffinity:
-    """GRPO group affinity for prefix cache sharing."""
+class TestLoadBalancerUidAffinity:
+    """GRPO uid affinity for prefix cache sharing."""
 
-    def test_same_group_same_server(self, ray_for_lb):
+    def test_same_uid_same_server(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(num_servers=4)
         servers = [
-            ray.get(lb.acquire_server.remote(request_id=f"rollout-{i}", group_key="prompt-42"))
+            ray.get(lb.acquire_server.remote(request_id=f"rollout-{i}", uid="prompt-42"))
             for i in range(8)
         ]
         assert len(set(servers)) == 1
 
-    def test_different_groups_spread(self, ray_for_lb):
+    def test_different_uids_spread(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(num_servers=4)
-        group_servers = {}
-        for g in range(4):
-            s = ray.get(lb.acquire_server.remote(request_id=f"g{g}-r0", group_key=f"group-{g}"))
+        uid_servers = {}
+        for uid_idx in range(4):
+            s = ray.get(lb.acquire_server.remote(request_id=f"g{uid_idx}-r0", uid=f"uid-{uid_idx}"))
             ray.get(lb.release_server.remote(server_idx=s))
-            group_servers[g] = s
-        assert len(set(group_servers.values())) == 4
+            uid_servers[uid_idx] = s
+        assert len(set(uid_servers.values())) == 4
 
     def test_grpo_simulation(self, ray_for_lb):
-        """4 groups × 8 rollouts across 4 servers: each group colocated, groups spread."""
+        """4 uids × 8 rollouts across 4 servers: each uid colocated, uids spread."""
         lb = GlobalRequestLoadBalancer.remote(num_servers=4)
-        group_to_server = {}
-        for group_idx in range(4):
-            group_key = f"uid-{group_idx}"
+        uid_to_server = {}
+        for uid_idx in range(4):
+            uid = f"uid-{uid_idx}"
             for rollout_idx in range(8):
                 s = ray.get(lb.acquire_server.remote(
-                    request_id=f"g{group_idx}-r{rollout_idx}", group_key=group_key,
+                    request_id=f"g{uid_idx}-r{rollout_idx}", uid=uid,
                 ))
-                if group_key not in group_to_server:
-                    group_to_server[group_key] = s
+                if uid not in uid_to_server:
+                    uid_to_server[uid] = s
                 else:
-                    assert s == group_to_server[group_key]
+                    assert s == uid_to_server[uid]
             for _ in range(8):
-                ray.get(lb.release_server.remote(server_idx=group_to_server[group_key]))
-        assert len(set(group_to_server.values())) == 4
+                ray.get(lb.release_server.remote(server_idx=uid_to_server[uid]))
+        assert len(set(uid_to_server.values())) == 4
