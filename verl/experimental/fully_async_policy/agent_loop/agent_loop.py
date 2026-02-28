@@ -333,13 +333,18 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         Returns:
             list[AgentLoopOutput]: Processing results
         """
-        worker_idx = 0
-        uid_batch = sample.non_tensor_batch.get("uid")
-        if uid_batch is not None and len(uid_batch) > 0 and uid_batch[0] is not None:
-            worker_idx = abs(hash(str(uid_batch[0]))) % len(self.agent_loop_workers)
-        worker = self.agent_loop_workers[worker_idx]
+        worker = self._select_best_worker()
         output_future = worker.generate_sequences_no_post.remote(sample, partial_output_list)
         return await asyncio.wrap_future(output_future.future())
+
+    def _select_best_worker(self):
+        """Select the best worker, simple round-robin load balancing"""
+        if not hasattr(self, "_worker_index"):
+            self._worker_index = 0
+
+        worker = self.agent_loop_workers[self._worker_index]
+        self._worker_index = (self._worker_index + 1) % len(self.agent_loop_workers)
+        return worker
 
     async def cancel(self):
         worker_cancel_tasks = [worker.cancel_agent_loops.remote() for worker in self.agent_loop_workers]
