@@ -472,9 +472,9 @@ class TestLoadBalancerRouting:
 
     def test_new_requests_avoid_loaded_server(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(num_servers=2)
-        s0 = ray.get(lb.acquire_server.remote(request_id="a", uid="heavy"))
-        ray.get(lb.acquire_server.remote(request_id="b", uid="heavy"))
-        ray.get(lb.acquire_server.remote(request_id="c", uid="heavy"))
+        s0 = ray.get(lb.acquire_server.remote(request_id="a"))
+        ray.get(lb.acquire_server.remote(request_id="a"))
+        ray.get(lb.acquire_server.remote(request_id="a"))
         s_new = ray.get(lb.acquire_server.remote(request_id="d"))
         assert s_new != s0
 
@@ -489,6 +489,16 @@ class TestLoadBalancerRouting:
         s3 = ray.get(lb.acquire_server.remote(request_id="r3"))
         assert s2 != s3
 
+    def test_release_invalid_server_raises(self, ray_for_lb):
+        lb = GlobalRequestLoadBalancer.remote(num_servers=2)
+        with pytest.raises(ray.exceptions.RayTaskError, match="Invalid server_idx for release"):
+            ray.get(lb.release_server.remote(server_idx=9))
+
+    def test_release_without_inflight_raises(self, ray_for_lb):
+        lb = GlobalRequestLoadBalancer.remote(num_servers=2)
+        with pytest.raises(ray.exceptions.RayTaskError, match="no inflight requests"):
+            ray.get(lb.release_server.remote(server_idx=1))
+
 
 class TestLoadBalancerStickySession:
     """Request-level sticky session."""
@@ -499,50 +509,3 @@ class TestLoadBalancerStickySession:
         ray.get(lb.release_server.remote(server_idx=s0))
         s1 = ray.get(lb.acquire_server.remote(request_id="conv-abc"))
         assert s0 == s1
-
-    def test_request_sticky_takes_priority_over_uid(self, ray_for_lb):
-        lb = GlobalRequestLoadBalancer.remote(num_servers=4)
-        s0 = ray.get(lb.acquire_server.remote(request_id="r1"))
-        ray.get(lb.release_server.remote(server_idx=s0))
-        ray.get(lb.acquire_server.remote(request_id="r2", uid="other-uid"))
-        s1 = ray.get(lb.acquire_server.remote(request_id="r1", uid="other-uid"))
-        assert s1 == s0
-
-
-class TestLoadBalancerUidAffinity:
-    """GRPO uid affinity for prefix cache sharing."""
-
-    def test_same_uid_same_server(self, ray_for_lb):
-        lb = GlobalRequestLoadBalancer.remote(num_servers=4)
-        servers = [
-            ray.get(lb.acquire_server.remote(request_id=f"rollout-{i}", uid="prompt-42"))
-            for i in range(8)
-        ]
-        assert len(set(servers)) == 1
-
-    def test_different_uids_spread(self, ray_for_lb):
-        lb = GlobalRequestLoadBalancer.remote(num_servers=4)
-        uid_servers = {}
-        for uid_idx in range(4):
-            s = ray.get(lb.acquire_server.remote(request_id=f"g{uid_idx}-r0", uid=f"uid-{uid_idx}"))
-            ray.get(lb.release_server.remote(server_idx=s))
-            uid_servers[uid_idx] = s
-        assert len(set(uid_servers.values())) == 4
-
-    def test_grpo_simulation(self, ray_for_lb):
-        """4 uids × 8 rollouts across 4 servers: each uid colocated, uids spread."""
-        lb = GlobalRequestLoadBalancer.remote(num_servers=4)
-        uid_to_server = {}
-        for uid_idx in range(4):
-            uid = f"uid-{uid_idx}"
-            for rollout_idx in range(8):
-                s = ray.get(lb.acquire_server.remote(
-                    request_id=f"g{uid_idx}-r{rollout_idx}", uid=uid,
-                ))
-                if uid not in uid_to_server:
-                    uid_to_server[uid] = s
-                else:
-                    assert s == uid_to_server[uid]
-            for _ in range(8):
-                ray.get(lb.release_server.remote(server_idx=uid_to_server[uid]))
-        assert len(set(uid_to_server.values())) == 4

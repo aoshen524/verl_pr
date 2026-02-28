@@ -27,7 +27,6 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopWorker,
     AsyncLLMServerManager,
     DictConfigWrap,
-    _current_uid,
     _agent_loop_registry,
     get_trajectory_info,
 )
@@ -68,9 +67,8 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             - Element 2 (bool): A flag or status indicating cancellation.
         """
         server_idx = None
-        uid = _current_uid.get(None)
         try:
-            server_idx, server = await self._acquire_server_with_index(request_id=request_id, uid=uid)
+            server_idx, server = await self._acquire_server_with_index(request_id=request_id)
             output = await server.generate_for_partial.remote(
                 request_id=request_id,
                 prompt_ids=prompt_ids,
@@ -198,10 +196,6 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
                 assert agent_name in _agent_loop_registry, (
                     f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
                 )
-                multi_turn_cfg = getattr(self.config.actor_rollout_ref.rollout, "multi_turn", {})
-                multi_turn_enabled = getattr(multi_turn_cfg, "enable", False)
-                uid = kwargs.get("uid")
-                _current_uid.set(str(uid) if not multi_turn_enabled and uid is not None else None)
 
                 agent_loop_config = _agent_loop_registry[agent_name]
                 agent_loop = hydra.utils.instantiate(

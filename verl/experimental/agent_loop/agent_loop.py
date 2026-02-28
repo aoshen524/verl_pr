@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import contextvars
 import logging
 import os
 import random
@@ -54,11 +53,6 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
-# Per-task uid for GRPO prefix cache affinity.
-# Set in _run_agent_loop, read in AsyncLLMServerManager.generate().
-# asyncio.create_task copies context, so each task has its own value.
-_current_uid: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("_current_uid", default=None)
-
 
 @ray.remote
 class GlobalRequestLoadBalancer:
@@ -71,7 +65,6 @@ class GlobalRequestLoadBalancer:
         self._inflight_requests = [0 for _ in range(num_servers)]
         self._next_server_idx = 0
         self._request_id_to_server = LRUCache(maxsize=max_cache_size)
-        self._uid_to_server = LRUCache(maxsize=max_cache_size)
 
     def _select_least_loaded_server_idx(self) -> int:
         min_inflight = min(self._inflight_requests)
@@ -83,31 +76,25 @@ class GlobalRequestLoadBalancer:
                 return candidate_idx
         raise RuntimeError("Failed to select a server for routing.")
 
-    def acquire_server(self, request_id: str, uid: str = None) -> int:
-        # 1) request-level sticky (multi-turn: same conversation → same server)
+    def acquire_server(self, request_id: str) -> int:
+        # request-level sticky (multi-turn: same conversation -> same server)
         if request_id in self._request_id_to_server:
             server_idx = self._request_id_to_server[request_id]
             self._inflight_requests[server_idx] += 1
             return server_idx
 
-        # 2) uid-level affinity (single-turn GRPO: same prompt uid → same server for APC)
-        if uid is not None and uid in self._uid_to_server:
-            server_idx = self._uid_to_server[uid]
-            self._request_id_to_server[request_id] = server_idx
-            self._inflight_requests[server_idx] += 1
-            return server_idx
-
-        # 3) new request: route to least loaded server
+        # new request: route to least loaded server
         server_idx = self._select_least_loaded_server_idx()
         self._request_id_to_server[request_id] = server_idx
-        if uid is not None:
-            self._uid_to_server[uid] = server_idx
         self._inflight_requests[server_idx] += 1
         return server_idx
 
     def release_server(self, server_idx: int) -> None:
-        if 0 <= server_idx < len(self._inflight_requests) and self._inflight_requests[server_idx] > 0:
-            self._inflight_requests[server_idx] -= 1
+        if not isinstance(server_idx, int) or not (0 <= server_idx < len(self._inflight_requests)):
+            raise ValueError(f"Invalid server_idx for release: {server_idx}")
+        if self._inflight_requests[server_idx] <= 0:
+            raise ValueError(f"Release called with no inflight requests on server {server_idx}")
+        self._inflight_requests[server_idx] -= 1
 
 
 class AsyncLLMServerManager:
@@ -134,11 +121,9 @@ class AsyncLLMServerManager:
         self.server_handles = server_handles
         self._load_balancer = load_balancer_handle
 
-    async def _acquire_server_with_index(self, request_id: str, uid: str = None) -> tuple[int, ray.actor.ActorHandle]:
-        server_idx = await self._load_balancer.acquire_server.remote(request_id=request_id, uid=uid)
+    async def _acquire_server_with_index(self, request_id: str) -> tuple[int, ray.actor.ActorHandle]:
+        server_idx = await self._load_balancer.acquire_server.remote(request_id=request_id)
         if not isinstance(server_idx, int) or not (0 <= server_idx < len(self.server_handles)):
-            # Release the acquired slot before raising to prevent inflight counter leak
-            self._load_balancer.release_server.remote(server_idx=server_idx)
             raise RuntimeError(f"Invalid server index returned by load balancer: {server_idx}")
         return server_idx, self.server_handles[server_idx]
 
@@ -170,9 +155,8 @@ class AsyncLLMServerManager:
             TokenOutput: token output
         """
         server_idx = None
-        uid = _current_uid.get(None)
         try:
-            server_idx, server = await self._acquire_server_with_index(request_id, uid=uid)
+            server_idx, server = await self._acquire_server_with_index(request_id)
             output = await server.generate.remote(
                 request_id=uuid4().hex,  # use new request_id for each turn
                 prompt_ids=prompt_ids,
@@ -565,14 +549,6 @@ class AgentLoopWorker:
             )
 
             agent_loop_config = _agent_loop_registry[agent_name]
-
-            # When multi_turn is disabled, all GRPO rollouts of the same prompt (uid)
-            # share the identical token prefix. Setting _current_uid routes them
-            # to the same vLLM server for automatic prefix caching (APC).
-            multi_turn_cfg = getattr(self.config.actor_rollout_ref.rollout, "multi_turn", {})
-            multi_turn_enabled = getattr(multi_turn_cfg, "enable", False)
-            uid = kwargs.get("uid")
-            _current_uid.set(str(uid) if not multi_turn_enabled and uid is not None else None)
 
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
